@@ -1,0 +1,168 @@
+import os
+import requests
+from datetime import datetime, timedelta
+
+# ============================
+# Config / Secrets
+# ============================
+
+# ---- PORT (from your snippet, but use env vars in real code) ----
+PORT_CLIENT_ID = 'r8clgr2uHc83eFZYlKV0HfYQLsTJOVIN'      # put your clientId here or in env
+PORT_CLIENT_SECRET = 'rrqgltlx3l5yhXjwfyvz8AgnCT5WMMWviPAPYvw8cIF7zuNobC4ixVwSlbMyRRzj'  # put your clientSecret here or in env
+PORT_API_URL = "https://api.port.io/v1"
+
+# ---- SPOT.IO ----
+SPOT_TOKEN = '9738bf0a6ea3c9f84f9193402c520cbbaebc676f36e87449d2480701bcf94c71'           # Spot Personal/API token
+SPOT_ACCOUNT_ID = 'act-6b105549'    # e.g. act-123abc
+OCEAN_CLUSTER_ID = 'o-a754585c' 
+# date range: last full day as an example
+# adjust this logic to what your FinOps team wants (daily / weekly / monthly)
+today = datetime.utcnow().date()
+yesterday = today - timedelta(days=1)
+FROM_DATE = '1764583200000'  # Dec 01, 2025 - working dates from Postman
+TO_DATE = '1764669600000'    # Dec 02, 2025 - working dates from Postman
+
+# If the Spot spec wants a datetime with time, you can instead use:
+# FROM_DATE = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+# TO_DATE = datetime.utcnow().strftime("%Y-%m-%dT23:59:59Z")
+
+
+# ============================
+# 1. Auth with Port
+# ============================
+
+def get_port_access_token() -> str:
+    creds = {
+        "clientId": PORT_CLIENT_ID,
+        "clientSecret": PORT_CLIENT_SECRET,
+    }
+    resp = requests.post(f"{PORT_API_URL}/auth/access_token", json=creds)
+    resp.raise_for_status()
+    return resp.json()["accessToken"]
+
+
+# ============================
+# 2. Call Spot.io aggregated costs
+# ============================
+
+def get_spot_cluster_costs() -> dict:
+    """
+    Calls the Ocean AWS K8s aggregated costs API.
+    """
+    base_url = "https://api.spotinst.io"
+    endpoint = f"/ocean/aws/k8s/cluster/{OCEAN_CLUSTER_ID}/aggregatedCosts"
+
+    headers = {
+        "Authorization": f"Bearer {SPOT_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    query_params = {
+        "accountId": SPOT_ACCOUNT_ID,
+    }
+    
+    body = {
+        "startTime": FROM_DATE,
+        "endTime": TO_DATE,
+        "groupBy": "namespace",
+    }
+
+    resp = requests.post(base_url + endpoint, headers=headers, params=query_params, json=body)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ============================
+# 3. Transform Spot response → Port entity
+# ============================
+
+def build_port_entity_from_spot_payload(spot_payload: dict) -> dict:
+    """
+    Extract the cost numbers from the Spot response and build a Port entity.
+
+    The exact JSON shape may differ; adjust keys according to the Spot spec.
+    Below is a typical Spot style with response.items[0].
+    """
+    response = spot_payload.get("response", {})
+    items = response.get("items", [])
+    if not items:
+        raise ValueError("No cost items returned from Spot")
+
+    item = items[0]
+    
+    # Navigate to the actual cost data in the Spot response structure
+    result = item.get("result", {})
+    total_for_duration = result.get("totalForDuration", {})
+    summary = total_for_duration.get("summary", {})
+    
+    total_cost = summary.get("total", 0)
+    
+    compute_data = summary.get("compute", {})
+    compute_cost = compute_data.get("total", 0) if isinstance(compute_data, dict) else 0
+    
+    storage_data = summary.get("storage", {})
+    storage_cost = storage_data.get("total", 0) if isinstance(storage_data, dict) else 0
+    
+    network_data = summary.get("network", {})
+    network_cost = network_data.get("total", 0) if isinstance(network_data, dict) else 0
+
+    # Use Unix timestamp from request for consistent identifier
+    period_start = FROM_DATE
+    period_end = TO_DATE
+
+    # Entity identifier per cluster per period (snapshot style) - use timestamp to avoid special chars
+    identifier = f"{OCEAN_CLUSTER_ID}-{period_start}"
+
+    entity = {
+        "identifier": identifier,
+        "title": f"Ocean Cluster Cost {OCEAN_CLUSTER_ID} [{period_start} – {period_end}]",
+        "properties": {
+            "cluster_id": OCEAN_CLUSTER_ID,
+            "account_id": SPOT_ACCOUNT_ID,
+            "total_cost": total_cost,
+            "compute_cost": compute_cost,
+            "storage_cost": storage_cost,
+            "network_cost": network_cost,
+            "period_start": period_start,
+            "period_end": period_end,
+        },
+    }
+
+    return entity
+
+
+# ============================
+# 4. Upsert entity into Port blueprint
+# ============================
+
+def upsert_cost_entity_in_port(entity: dict, blueprint_id: str = "spot_ocean_cluster_costs") -> None:
+    access_token = get_port_access_token()
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+
+    url = f"{PORT_API_URL}/blueprints/{blueprint_id}/entities"
+    params = {"upsert": "true"}
+
+    resp = requests.post(url, headers=headers, params=params, json=entity)
+    resp.raise_for_status()
+    print("Port entity upserted successfully:", resp.status_code)
+
+
+# ============================
+# 5. Main
+# ============================
+
+if __name__ == "__main__":
+    # Use env vars if available, otherwise fall back to hardcoded values
+    PORT_CLIENT_ID = os.getenv("PORT_CLIENT_ID", PORT_CLIENT_ID)
+    PORT_CLIENT_SECRET = os.getenv("PORT_CLIENT_SECRET", PORT_CLIENT_SECRET)
+    SPOT_TOKEN = os.getenv("SPOT_TOKEN", SPOT_TOKEN)
+    SPOT_ACCOUNT_ID = os.getenv("SPOT_ACCOUNT_ID", SPOT_ACCOUNT_ID)
+    OCEAN_CLUSTER_ID = os.getenv("OCEAN_CLUSTER_ID", OCEAN_CLUSTER_ID)
+
+    spot_json = get_spot_cluster_costs()
+    entity = build_port_entity_from_spot_payload(spot_json)
+    upsert_cost_entity_in_port(entity)
