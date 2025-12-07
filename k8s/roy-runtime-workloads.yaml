@@ -6,7 +6,7 @@ metadata:
     app: transactions
     portWorkload: roy-runtime
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: transactions
@@ -30,7 +30,7 @@ metadata:
     app: agent
     portWorkload: roy-runtime
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: agent
@@ -54,7 +54,7 @@ metadata:
     app: editor
     portWorkload: roy-runtime
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: editor
